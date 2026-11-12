@@ -1,0 +1,106 @@
+name: Build and deploy site
+
+# Checks hourly whether rangoric-srd's main branch has moved, and builds only if it has,
+# so the site rebuilds at most once an hour however many PRs get merged.
+# "Run workflow" (manual) and pushes to this repo always build.
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SRD_REPO: Rangoric/rangoric-srd
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: check
+        run: |
+          sha=$(git ls-remote "https://github.com/${SRD_REPO}.git" refs/heads/main | cut -f1)
+          last=$(cat .last-built-srd-sha 2>/dev/null || true)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" != "schedule" ] || [ "$sha" != "$last" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Building: SRD at $sha (last built ${last:-never}, trigger ${{ github.event_name }})"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "SRD unchanged since $last; nothing to do"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check out the SRD
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SRD_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: content/rangoric-srd
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - name: Cache Quartz plugins
+        uses: actions/cache@v5
+        with:
+          path: .quartz/plugins
+          key: ${{ runner.os }}-plugins-${{ hashFiles('quartz.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-plugins-
+      - run: npm ci
+      - run: npx quartz plugin install
+      - run: npx quartz build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  record:
+    # Remembers which SRD commit is live. The commit also keeps this repo "active",
+    # so GitHub doesn't switch off the hourly schedule after 60 quiet days.
+    needs: [check, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          echo "${{ needs.check.outputs.sha }}" > .last-built-srd-sha
+          git config user.name "Wilson"
+          git config user.email "rangoric+srd@gmail.com"
+          git add .last-built-srd-sha
+          git diff --cached --quiet && exit 0
+          git commit -m "Built from rangoric-srd ${{ needs.check.outputs.sha }} [skip ci]"
+          git push
